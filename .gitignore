@@ -1,0 +1,11 @@
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.yml
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log

@@ -1,106 +1,188 @@
-# Gold (XAUUSD) Signal Bot — Linux, Signal-Only
+# Gold (XAU/USD) 15-Minute Signal Bot
 
-Runs entirely on native Linux. No MT5, no Wine, no broker login required.
-Claude analyzes gold price data and sends you a signal via Telegram; you
-manually place the trade in VT Markets/XM yourself if you like it.
+Analyses the 15-minute gold chart every 15 minutes and sends you one Telegram
+message per run — a full analysis update with an explicit **BUY / SELL / STAND
+ASIDE**, its confluence score, and the reasons behind it.
 
-## What it does NOT do
-- Does not log into VT Markets or XM
-- Does not place any trades
-- Does not need Windows/Wine/MT5 at all
+Runs entirely on GitHub Actions. No server, no VPS, no broker login, no MT5.
+No LLM — the analysis is deterministic, so the same candles always produce the
+same message.
 
-## Option A: Run for free via GitHub Actions (recommended — nothing to host)
+---
 
-This runs the bot on GitHub's servers on a schedule. No VPS, no cost, and
-your iPhone doesn't need to run anything — it just receives the Telegram
-message. (iOS doesn't allow apps to run continuous background scripts, so
-this cloud-schedule approach is the practical way to get "always running,
-reachable anywhere" behavior.)
+## What you get on Telegram
 
-### Steps
-1. Create a new **private** GitHub repo and push all these files to it
-   (including `.github/workflows/gold-signal.yml`).
-2. Go to the repo's **Settings → Secrets and variables → Actions** and add
-   four repository secrets:
-   - `ANTHROPIC_API_KEY`
-   - `TWELVE_DATA_API_KEY`
-   - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_CHAT_ID`
-   (See the "Get a free Twelve Data API key" and "Create a Telegram bot"
-   sections below for how to obtain these.)
-3. Go to the **Actions** tab, find "Gold Signal Bot," and click
-   **Enable workflow** if prompted.
-4. It'll now run automatically every ~15 minutes. To test it immediately
-   without waiting, go to Actions → Gold Signal Bot → **Run workflow**
-   (this is the `workflow_dispatch` trigger).
-5. Telegram messages will arrive on your phone as normal — no dashboard
-   needed for this mode, though `app.py`/`state.json` won't persist
-   between runs here since each run is a fresh container. If you want
-   history logging in this mode too, ask and I can add a step that commits
-   `state.json` back to the repo after each run.
+Every 15 minutes:
 
-**Note on schedule timing:** GitHub Actions cron schedules are "best
-effort" — during periods of high platform load, runs can be delayed by a
-few minutes. Fine for this use case, just not millisecond-precise.
-
-## Option B: Run continuously on your own Linux machine
-
-### 1. Install dependencies
 ```
-pip install requests pandas anthropic flask
+🔴 GOLD XAU/USD — SELL
+15m bar: 2026-09-08 17:31:06 UTC
+
+Price 4439.60  ▲ +0.30
+RSI 46.8   ATR 8.54
+EMA20 4441.16 | EMA50 4448.02 | EMA200 4469.07
+20-bar range 4425.10 – 4457.90
+
+Confluence 4/5  ████░
+  ✓ trend vs EMA200
+  ✓ EMA20/50 stacked
+  ✓ RSI not exhausted (47)
+  ✓ volatility normal
+
+Entry 4439.60
+Stop 4452.42   Target 4422.51   R:R 1.3
+
+⚠️ Rule-based monitor, not advice.
 ```
 
-### 2. Get a free Twelve Data API key (price data source)
-- Sign up at https://twelvedata.com (free tier is enough for 15-min polling)
-- Copy your API key
+When nothing lines up, you still get the update — it just says **STAND ASIDE**
+and shows which of the five tests failed.
 
-### 3. Create a Telegram bot
-1. Open Telegram, search for **@BotFather**, start a chat
-2. Send `/newbot`, follow the prompts (pick a name, and a username ending in `bot`)
-3. BotFather replies with a token like `123456789:AAExampleTokenString` — save it
-4. Send your new bot any message (e.g. "hi") so it registers your chat
-5. Visit this in a browser, replacing `TOKEN`:
+---
+
+## How the analysis works
+
+Direction comes from a 20-bar range break, falling back to the EMA stack.
+Then five **independent** tests are scored:
+
+| # | Test | Passes when |
+|---|---|---|
+| 1 | trend vs EMA200 | price is on the trend side of the 200 EMA |
+| 2 | EMA20/50 stacked | the short EMAs agree with the direction |
+| 3 | RSI not exhausted | RSI(14) is between 30 and 70 |
+| 4 | broke 20-bar range | close is outside the last 20 bars' high/low |
+| 5 | volatility normal | ATR is 0.6–2.0× its recent median |
+
+A **BUY/SELL** is only called when the score reaches `MIN_CONF` (default **4**).
+Below that you get STAND ASIDE. Stop loss is 1.5×ATR, target 2.0×ATR.
+
+---
+
+## Setup
+
+### 1. Get a Twelve Data API key (free)
+
+1. Sign up at <https://twelvedata.com>
+2. Copy your API key. The free tier is enough for a 15-minute poll.
+
+### 2. Create a Telegram bot
+
+1. In Telegram, search for **@BotFather** and start a chat.
+2. Send `/newbot`, then pick a name and a username ending in `bot`.
+3. BotFather replies with a token like `123456789:AAExampleTokenString`. Keep it.
+4. **Send your new bot any message** (e.g. "hi") — it can't message you until you do.
+5. Open this in a browser, replacing `TOKEN`:
    `https://api.telegram.org/botTOKEN/getUpdates`
-6. Find `"chat":{"id": ...}` in the response — that number is your chat ID
+6. Find `"chat":{"id":123456789}` in the response. That number is your chat ID.
 
-### 4. Set environment variables
-```
-export ANTHROPIC_API_KEY="your-anthropic-key"
-export TWELVE_DATA_API_KEY="your-twelvedata-key"
-export TELEGRAM_BOT_TOKEN="your-bot-token"
-export TELEGRAM_CHAT_ID="your-chat-id"
-```
-(Add these to `~/.bashrc` so they persist across terminal sessions.)
+### 3. Push this repo
 
-### 5. Run it
-In one terminal:
+```bash
+git clone https://github.com/akramsakib/Trading-Bot.git
+cd Trading-Bot
+git remote set-url origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
+git push -u origin main
 ```
-python signal_bot.py
+
+### 4. Add the three secrets
+
+In GitHub: **Settings → Secrets and variables → Actions → New repository secret**
+
+| Secret name | Value |
+|---|---|
+| `TWELVE_DATA_API_KEY` | your Twelve Data key |
+| `TELEGRAM_BOT_TOKEN` | the BotFather token |
+| `TELEGRAM_CHAT_ID` | your numeric chat ID |
+
+> Put these in **Secrets**, never in the code or the workflow file.
+
+### 5. Turn the schedule on
+
+Go to the **Actions** tab → **Gold 15m Signal** → **I understand my workflows,
+go ahead and enable them** if prompted.
+
+To test immediately instead of waiting: click **Run workflow** (that's the
+`workflow_dispatch` trigger). You should get a Telegram message within a minute.
+
+After that it runs automatically at :00, :15, :30 and :45 every hour.
+
+---
+
+## Tuning
+
+Change these in `.github/workflows/gold-signal.yml` under `env`:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MIN_CONF` | `4` | `5` = fewer, stricter signals. `3` = more, noisier. |
+
+Or edit `signal.py`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `ATR_SL` | `1.5` | stop loss distance, in ATR |
+| `ATR_TP` | `2.0` | target distance, in ATR |
+| `SYMBOL` | `XAU/USD` | any Twelve Data symbol |
+
+### Running it locally
+
+```bash
+pip install -r requirements.txt
+export TWELVE_DATA_API_KEY="..."
+export TELEGRAM_BOT_TOKEN="..."
+export TELEGRAM_CHAT_ID="..."
+python signal.py
 ```
-In a second terminal, if you want the web log too:
-```
-python app.py
-```
-Open `http://<your-linux-ip>:5000` from your phone's browser for the signal
-history. Telegram messages arrive automatically — no need to keep the
-dashboard open.
+
+Leave the Telegram variables unset and it prints the message to your terminal
+instead of sending it — useful for testing.
+
+---
+
+## Known limitations — read this
+
+**This is a monitor, not a profitable system.** The backtests in this project's
+history found no reliable edge: on 2.4 years of hourly gold, buy-and-hold beat
+every rule tested, and a random-entry baseline was profitable in the same
+number of periods as the best rule. The confluence filter cuts noise
+dramatically; it does not create an edge. **Verify every signal on your own
+chart before acting on it.**
+
+**Prices will not exactly match MT5 / VT Markets.** Expect a permanent offset
+of roughly $0.15–$0.40:
+
+- MT5 charts show the **bid**; Twelve Data's XAU/USD is a mid/last aggregation.
+- They are **different data providers** with different liquidity sources.
+- Candle close times depend on your broker's server timezone (often GMT+2/+3).
+- Polling every 15 minutes means you are always up to a quarter-hour behind.
+
+If you need your broker's exact price, the data source has to be your broker.
+
+**GitHub Actions cron is best-effort.** During high platform load runs can be
+delayed by a few minutes. Fine here, but not second-precise.
+
+**Rate limits.** 96 messages a day to one chat is well inside Telegram's limits.
+Twelve Data's free tier allows it, but if you shorten the interval you will hit
+the ~800 requests/day cap.
+
+---
 
 ## Files
-- `data_feed.py` — pulls XAUUSD candles + indicators from Twelve Data
-- `signal_bot.py` — continuous-loop version (Option B: your own machine)
-- `run_once.py` — single-cycle version (Option A: GitHub Actions)
-- `.github/workflows/gold-signal.yml` — the GitHub Actions schedule
-- `requirements.txt` — dependencies for the GitHub Actions runner
-- `telegram_notify.py` — Telegram send helper + message formatting
-- `shared_state.py` — JSON log file shared with the dashboard (Option B only)
-- `app.py` + `templates/dashboard.html` — optional view-only web log (Option B only)
 
-## Notes
-- Poll interval defaults to 15 minutes (`POLL_SECONDS` in `signal_bot.py`),
-  matching the candle timeframe. Change both together if you adjust it.
-- Since there's no execution, there's no risk filter needed here — but the
-  system prompt still nudges Claude toward conservative sizing and "hold"
-  when signals are unclear. Treat every signal as a suggestion to evaluate,
-  not an instruction to follow blindly.
-- This can run on any always-on Linux machine (a Raspberry Pi works fine)
-  since there's no MT5/Wine dependency.
+| File | Purpose |
+|---|---|
+| `signal.py` | the whole bot: fetch, indicators, confluence, Telegram |
+| `.github/workflows/gold-signal.yml` | the every-15-minutes schedule |
+| `requirements.txt` | just `requests` |
+
+---
+
+## Security
+
+Secrets live in GitHub Actions, never in the repo. The code logs Telegram
+failure status codes but never the token. `.gitignore` blocks `.env`, `*.pem`,
+`*.key` and `credentials.json`.
+
+## License
+
+MIT — see `LICENSE`.
