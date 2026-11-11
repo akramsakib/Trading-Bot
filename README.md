@@ -1,188 +1,103 @@
-# Gold (XAU/USD) 15-Minute Signal Bot
+# Gold (XAU/USD) 15-Minute AI Signal Monitor
 
-Analyses the 15-minute gold chart every 15 minutes and sends you one Telegram
-message per run — a full analysis update with an explicit **BUY / SELL / STAND
-ASIDE**, its confluence score, and the reasons behind it.
+This experimental GitHub Actions bot fetches 15-minute gold candles, asks
+**Kimi K2.6** to choose BUY, SELL, or STAND ASIDE, and sends the result to
+Telegram. It does **not** place trades or connect to a broker.
 
-Runs entirely on GitHub Actions. No server, no VPS, no broker login, no MT5.
-No LLM — the analysis is deterministic, so the same candles always produce the
-same message.
+**The AI strategy has not been backtested or proven profitable.** AI can make
+mistakes, invent explanations, or change its answer for the same data. Paper
+trade and independently verify signals before considering any real-money use.
 
----
+## How it works
 
-## What you get on Telegram
+1. Twelve Data supplies candles. The bot requests UTC, assumes timestamps are
+   candle start times, and uses only candles at least two minutes past closing.
+2. Code calculates RSI, ATR, EMA20/50/200, a prior 20-bar range and the original
+   rule-based reference. Kimi receives those values plus the last 40 closed
+   OHLC candles. It has no live quote, news, account information, or tools.
+3. Kimi chooses the final action. It can disagree with the rule-based reference,
+   including choosing BUY or SELL when the rules say STAND ASIDE. The rule
+   score is **not** a probability. `MIN_CONF` affects only the reference, not
+   the AI's decision.
+4. For BUY/SELL, the code (not the AI) calculates illustrative stop and target
+   levels at 1.5×ATR and 2×ATR from the last close. These are not executable
+   quotes; spreads, slippage, and delayed delivery change real risk and reward.
+5. Invalid or incomplete AI output, a missing key, timeouts, or data that
+   becomes stale while waiting result in STAND ASIDE rather than falling back
+   to a rule-based trade. The run fails so the problem is visible in Actions.
+   A stale feed or market closure also produces STAND ASIDE without calling AI;
+   expect repeated messages during weekends. Other market-data errors fail the
+   run without a signal. Telegram delivery failures also fail the run.
 
-Every 15 minutes:
-
-```
-🔴 GOLD XAU/USD — SELL
-15m bar: 2026-09-08 17:31:06 UTC
-
-Price 4439.60  ▲ +0.30
-RSI 46.8   ATR 8.54
-EMA20 4441.16 | EMA50 4448.02 | EMA200 4469.07
-20-bar range 4425.10 – 4457.90
-
-Confluence 4/5  ████░
-  ✓ trend vs EMA200
-  ✓ EMA20/50 stacked
-  ✓ RSI not exhausted (47)
-  ✓ volatility normal
-
-Entry 4439.60
-Stop 4452.42   Target 4422.51   R:R 1.3
-
-⚠️ Rule-based monitor, not advice.
-```
-
-When nothing lines up, you still get the update — it just says **STAND ASIDE**
-and shows which of the five tests failed.
-
----
-
-## How the analysis works
-
-Direction comes from a 20-bar range break, falling back to the EMA stack.
-Then five **independent** tests are scored:
-
-| # | Test | Passes when |
-|---|---|---|
-| 1 | trend vs EMA200 | price is on the trend side of the 200 EMA |
-| 2 | EMA20/50 stacked | the short EMAs agree with the direction |
-| 3 | RSI not exhausted | RSI(14) is between 30 and 70 |
-| 4 | broke 20-bar range | close is outside the last 20 bars' high/low |
-| 5 | volatility normal | ATR is 0.6–2.0× its recent median |
-
-A **BUY/SELL** is only called when the score reaches `MIN_CONF` (default **4**).
-Below that you get STAND ASIDE. Stop loss is 1.5×ATR, target 2.0×ATR.
-
----
+The bot validates the AI response format, **not the truth or profitability**
+of its reasoning. Only market candles and indicators are sent to Moonshot AI;
+API keys and Telegram details are not included in the AI prompt.
 
 ## Setup
 
-### 1. Get a Twelve Data API key (free)
+1. Get a [Twelve Data API key](https://twelvedata.com) and a **Moonshot/Kimi
+   Global API key** from the [Kimi API platform](https://platform.moonshot.ai/).
+   This integration uses `https://api.moonshot.ai/v1` and `kimi-k2.6` in
+   thinking mode. An Arena API key is **not** used or interchangeable with a
+   Moonshot key. Make sure your account has access and sufficient API credit.
+2. Create a Telegram bot with @BotFather and send it a message. Obtain its chat
+   ID through Telegram's `getUpdates` endpoint. Keep the bot token private.
+3. In the GitHub repository, open **Settings → Secrets and variables → Actions
+   → New repository secret**, and add:
 
-1. Sign up at <https://twelvedata.com>
-2. Copy your API key. The free tier is enough for a 15-minute poll.
+   | Name | Value |
+   |---|---|
+   | `MOONSHOT_API_KEY` | Kimi Global API key |
+   | `TWELVE_DATA_API_KEY` | Twelve Data API key |
+   | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
+   | `TELEGRAM_CHAT_ID` | Telegram chat ID |
 
-### 2. Create a Telegram bot
+   Never paste keys into source code, commits, public logs, or chat.
+4. Deploy these changes to the repository's default branch. GitHub scheduled
+   workflows use that branch's workflow file. Enable **Gold 15m Signal** in the
+   Actions tab if it is disabled. For a manual check, use **Run workflow** and
+   select the branch containing these changes. Start with paper trading.
 
-1. In Telegram, search for **@BotFather** and start a chat.
-2. Send `/newbot`, then pick a name and a username ending in `bot`.
-3. BotFather replies with a token like `123456789:AAExampleTokenString`. Keep it.
-4. **Send your new bot any message** (e.g. "hi") — it can't message you until you do.
-5. Open this in a browser, replacing `TOKEN`:
-   `https://api.telegram.org/botTOKEN/getUpdates`
-6. Find `"chat":{"id":123456789}` in the response. That number is your chat ID.
+The schedule is :03, :18, :33 and :48 UTC each hour. GitHub Actions can delay
+or skip runs; the bot can also send repeated signals for the same candle. Its
+2-minute candle-finalization grace does not guarantee the provider will not
+revise data. A candle older than 30 minutes after close is considered stale.
 
-### 3. Push this repo
+## Cost and limitations
 
-```bash
-git clone https://github.com/akramsakib/Trading-Bot.git
-cd Trading-Bot
-git remote set-url origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
-git push -u origin main
-```
+A run with fresh market data makes **one paid Kimi request**, potentially 96
+requests per day, with up to 2,048 output/reasoning tokens per request. Check
+Moonshot's current pricing, quotas, and your account's spend controls before
+enabling the schedule. AI requests have a 90-second read timeout. No Kimi call
+is made for stale market data.
 
-### 4. Add the three secrets
+Prices may differ from your broker's bid/ask and candle timestamps. Stop/target
+levels, execution assumptions, and a historical reference close are not actual
+fills. The workflow has no knowledge of existing positions and cannot manage
+risk in a brokerage account.
 
-In GitHub: **Settings → Secrets and variables → Actions → New repository secret**
+## Local use and tests
 
-| Secret name | Value |
-|---|---|
-| `TWELVE_DATA_API_KEY` | your Twelve Data key |
-| `TELEGRAM_BOT_TOKEN` | the BotFather token |
-| `TELEGRAM_CHAT_ID` | your numeric chat ID |
-
-> Put these in **Secrets**, never in the code or the workflow file.
-
-### 5. Turn the schedule on
-
-Go to the **Actions** tab → **Gold 15m Signal** → **I understand my workflows,
-go ahead and enable them** if prompted.
-
-To test immediately instead of waiting: click **Run workflow** (that's the
-`workflow_dispatch` trigger). You should get a Telegram message within a minute.
-
-After that it runs automatically at :00, :15, :30 and :45 every hour.
-
----
-
-## Tuning
-
-Change these in `.github/workflows/gold-signal.yml` under `env`:
-
-| Variable | Default | Effect |
-|---|---|---|
-| `MIN_CONF` | `4` | `5` = fewer, stricter signals. `3` = more, noisier. |
-
-Or edit `signal.py`:
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `ATR_SL` | `1.5` | stop loss distance, in ATR |
-| `ATR_TP` | `2.0` | target distance, in ATR |
-| `SYMBOL` | `XAU/USD` | any Twelve Data symbol |
-
-### Running it locally
+After `pip install -r requirements.txt`, set the four environment variables
+above securely and run `python signal.py`. Without Telegram settings, messages
+are printed but the process exits unsuccessfully rather than claiming delivery.
+Tests do not call external APIs:
 
 ```bash
-pip install -r requirements.txt
-export TWELVE_DATA_API_KEY="..."
-export TELEGRAM_BOT_TOKEN="..."
-export TELEGRAM_CHAT_ID="..."
-python signal.py
+python -m unittest discover -s tests -v
+python -m unittest discover -s research -p 'test_*.py' -v
 ```
 
-Leave the Telegram variables unset and it prints the message to your terminal
-instead of sending it — useful for testing.
-
----
-
-## Known limitations — read this
-
-**This is a monitor, not a profitable system.** The backtests in this project's
-history found no reliable edge: on 2.4 years of hourly gold, buy-and-hold beat
-every rule tested, and a random-entry baseline was profitable in the same
-number of periods as the best rule. The confluence filter cuts noise
-dramatically; it does not create an edge. **Verify every signal on your own
-chart before acting on it.**
-
-**Prices will not exactly match MT5 / VT Markets.** Expect a permanent offset
-of roughly $0.15–$0.40:
-
-- MT5 charts show the **bid**; Twelve Data's XAU/USD is a mid/last aggregation.
-- They are **different data providers** with different liquidity sources.
-- Candle close times depend on your broker's server timezone (often GMT+2/+3).
-- Polling every 15 minutes means you are always up to a quarter-hour behind.
-
-If you need your broker's exact price, the data source has to be your broker.
-
-**GitHub Actions cron is best-effort.** During high platform load runs can be
-delayed by a few minutes. Fine here, but not second-precise.
-
-**Rate limits.** 96 messages a day to one chat is well inside Telegram's limits.
-Twelve Data's free tier allows it, but if you shorten the interval you will hit
-the ~800 requests/day cap.
-
----
+The prior [historical backtest](research/backtest_report.md) evaluates **only
+the old deterministic rules**, not Kimi. It cannot establish the performance
+of the new AI strategy.
 
 ## Files
 
-| File | Purpose |
-|---|---|
-| `signal.py` | the whole bot: fetch, indicators, confluence, Telegram |
-| `.github/workflows/gold-signal.yml` | the every-15-minutes schedule |
-| `requirements.txt` | just `requests` |
+- `signal.py`: data validation, indicators, local risk levels and Telegram.
+- `kimi_brain.py`: Kimi request and strict response validation.
+- `.github/workflows/gold-signal.yml`: schedule and secret wiring.
+- `tests/`: mocked API and safety checks.
+- `research/`: original rule-based backtest and its assumptions.
 
----
-
-## Security
-
-Secrets live in GitHub Actions, never in the repo. The code logs Telegram
-failure status codes but never the token. `.gitignore` blocks `.env`, `*.pem`,
-`*.key` and `credentials.json`.
-
-## License
-
-MIT — see `LICENSE`.
+MIT licensed; see `LICENSE`.
