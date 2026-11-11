@@ -1,5 +1,6 @@
 import io
 import json
+import math
 import os
 import unittest
 from contextlib import redirect_stderr
@@ -89,13 +90,104 @@ class KimiTests(unittest.TestCase):
 
     def test_ai_action_overrides_rule_and_levels_are_local(self):
         self.info['action'] = 'STAND ASIDE'
-        result = bot.format_ai_message(self.info, {'action': 'BUY', 'reason': 'Trend.'})
+        decision = {'action': 'BUY', 'reason': 'Trend.', 'strategy': 'trend_pullback', 'hold_minutes': 12}
+        result = bot.format_ai_message(self.info, decision)
         self.assertIn('— BUY', result)
         self.assertIn('Rule reference: STAND ASIDE', result)
-        self.assertIn(f"Illustrative stop {self.info['price'] - bot.ATR_SL * self.info['atr']:.2f}", result)
-        result = bot.format_ai_message(self.info, {'action': 'SELL', 'reason': 'Trend.'})
-        self.assertIn(f"Illustrative stop {self.info['price'] + bot.ATR_SL * self.info['atr']:.2f}", result)
-        self.assertNotIn('Illustrative stop', bot.format_ai_message(self.info, {'action': 'STAND ASIDE', 'reason': 'Unclear.'}))
+        # Levels are calculated locally from ATR, never taken from the AI.
+        self.assertIn(f"Stop {self.info['price'] - bot.ATR_SL * self.info['atr']:.2f}", result)
+        self.assertIn(f"Target {self.info['price'] + bot.ATR_TP * self.info['atr']:.2f}", result)
+        self.assertIn('Playbook: trend_pullback', result)
+        self.assertIn('12m', result)
+        result = bot.format_ai_message(self.info, {'action': 'SELL', 'reason': 'Trend.',
+                                                   'strategy': None, 'hold_minutes': None})
+        self.assertIn(f"Stop {self.info['price'] + bot.ATR_SL * self.info['atr']:.2f}", result)
+        self.assertNotIn('Stop ', bot.format_ai_message(self.info, {'action': 'STAND ASIDE',
+                                                                    'reason': 'Unclear.',
+                                                                    'strategy': None,
+                                                                    'hold_minutes': None}))
+
+    def test_scalp_message_shows_session_cost_and_horizon(self):
+        result = bot.format_ai_message(self.info, {'action': 'BUY', 'reason': 'Trend.',
+                                                   'strategy': 'breakout', 'hold_minutes': 9})
+        self.assertIn(f"scalp {bot.HOLD_MIN}–{bot.HOLD_MAX}m", result)
+        self.assertIn('Session', result)
+        self.assertIn('ADX', result)
+        self.assertIn('Net R:R', result)
+        self.assertIn('spread', result)
+        self.assertNotIn('nan', result.lower().replace('stand', ''))
+
+    def test_cost_gate_blocks_a_spread_dominated_scalp(self):
+        """With a large spread and a small ATR there is nothing worth scalping."""
+        cheap = bot.scalp_plan(100.0, 8.0, 1, spread=0.4)
+        self.assertTrue(cheap['passes_cost_gate'])
+        self.assertGreater(cheap['net_rr'], 1.0)
+        dead = bot.scalp_plan(100.0, 1.0, 1, spread=0.4)
+        self.assertFalse(dead['passes_cost_gate'])
+        self.assertLess(dead['net_rr'], bot.MIN_NET_RR)
+        # The plan scales with volatility, so a bigger ATR re-opens the trade.
+        self.assertTrue(bot.scalp_plan(100.0, 1.0, 1, spread=0.0)['passes_cost_gate'])
+
+
+class ScalpPlanAndCostTests(unittest.TestCase):
+    def setUp(self):
+        now = datetime.now(timezone.utc)
+        self.bars = [bot.Bar((now - timedelta(minutes=15 * (299-i) + 18)).strftime('%Y-%m-%d %H:%M:%S'),
+                             100 + i/100, 102 + i/100, 99 + i/100, 101 + i/100)
+                     for i in range(300)]
+        self.info = bot.analyse(self.bars)
+
+    def test_scalp_levels_are_fractions_of_atr(self):
+        plan = bot.scalp_plan(self.info['price'], self.info['atr'], 1)
+        self.assertAlmostEqual(plan['stop'], self.info['price'] - bot.ATR_SL * self.info['atr'])
+        self.assertAlmostEqual(plan['target'], self.info['price'] + bot.ATR_TP * self.info['atr'])
+        self.assertLess(plan['target_usd'], self.info['atr'])  # a scalp, not a swing
+        self.assertLessEqual(plan['stop_usd'], self.info['atr'])
+
+    def test_invalid_scalp_configuration_fails_closed(self):
+        bars = [bot.Bar(str(i), 100, 101, 99, 100) for i in range(300)]
+        for name, value in (('HOLD_MIN', 0), ('HOLD_MAX', 0), ('SPREAD_USD', -1),
+                            ('MIN_NET_RR', 0), ('SPREAD_USD', math.nan)):
+            with patch.object(bot, name, value), self.assertRaises(ValueError):
+                bot.analyse(bars)
+        with patch.object(bot, 'HOLD_MIN', 30), self.assertRaises(ValueError):
+            bot.analyse(bars)  # HOLD_MIN > HOLD_MAX
+
+    def test_strategy_scores_and_indicators_are_populated(self):
+        for key in ('ema9', 'ema200', 'rsi7', 'macd', 'macd_hist', 'bb_up', 'bb_lo',
+                    'stoch_k', 'adx', 'cci', 'williams_r', 'atr_percentile'):
+            self.assertIn(key, self.info)
+        for key in ('session', 'candle_shapes', 'levels', 'strategies', 'plans'):
+            self.assertIn(key, self.info)
+        self.assertEqual(len(self.info['strategies']), 5)
+        for item in self.info['strategies']:
+            self.assertIn(item['direction'], ('BUY', 'SELL', 'none'))
+            self.assertIn(item['name'], ('trend_pullback', 'breakout', 'mean_reversion',
+                                         'momentum_macd', 'range_fade'))
+            self.assertIsInstance(item['score'], int)
+        # Every value handed to the AI must be JSON-serialisable (no NaN/inf).
+        json.dumps(bot.kimi_brain.build_snapshot(self.bars, self.info, 'XAU/USD'),
+                   allow_nan=False)
+
+    def test_candle_shape_and_swing_levels(self):
+        bar = bot.Bar('2026-01-01 00:00:00', 100, 103, 99, 102)
+        shape = bot.candle_shape(bar)
+        self.assertEqual(shape['dir'], 'up')
+        self.assertAlmostEqual(shape['body'] + shape['upper_wick'] + shape['lower_wick'], 1.0, places=2)
+        levels = bot.swing_levels(self.bars, len(self.bars) - 1)
+        self.assertTrue(all(lvl['kind'] in ('high', 'low') for lvl in levels))
+
+    def test_session_labels(self):
+        self.assertEqual(bot.session(datetime(2026, 6, 15, 13, tzinfo=timezone.utc))['liquidity'], 'highest')
+        self.assertEqual(bot.session(datetime(2026, 6, 15, 3, tzinfo=timezone.utc))['liquidity'], 'low')
+        self.assertEqual(bot.session(datetime(2026, 6, 13, 12, tzinfo=timezone.utc))['liquidity'], 'none')
+
+    def test_lower_timeframe_summary_is_optional(self):
+        with patch.dict(os.environ, {'TWELVE_DATA_API_KEY': 'k'}):
+            with patch.object(bot.requests, 'get', side_effect=bot.DataError('no data')):
+                self.assertIsNone(bot.fetch_lower_tf())
+        with patch.dict(os.environ, {'USE_M5': '0'}):
+            self.assertIsNone(bot.fetch_lower_tf())
 
     @patch.object(bot, 'send_telegram', return_value=True)
     @patch.object(ai, 'decide', side_effect=ai.AIError('unavailable'))
@@ -105,12 +197,27 @@ class KimiTests(unittest.TestCase):
         self.assertIn('STAND ASIDE', send.call_args.args[0])
         self.assertNotIn('— BUY', send.call_args.args[0])
 
+    @patch.object(bot, 'SPREAD_USD', 0.0)
     @patch.object(bot, 'send_telegram', return_value=True)
-    @patch.object(ai, 'decide', return_value={'action': 'BUY', 'reason': 'Trend.'})
+    @patch.object(ai, 'decide', return_value={'action': 'BUY', 'reason': 'Trend.',
+                                              'strategy': 'trend_pullback', 'hold_minutes': 10})
     def test_main_ai_can_decide_buy(self, decide, send):
         with patch.object(bot, 'fetch_bars', return_value=self.bars):
             self.assertEqual(bot.main(), 0)
         self.assertIn('— BUY', send.call_args.args[0])
+        self.assertIn('Net R:R', send.call_args.args[0])
+
+    @patch.object(bot, 'SPREAD_USD', 5.0)   # absurdly wide: nothing can beat it
+    @patch.object(bot, 'send_telegram', return_value=True)
+    @patch.object(ai, 'decide', return_value={'action': 'BUY', 'reason': 'Trend.',
+                                              'strategy': None, 'hold_minutes': None})
+    def test_main_cost_gate_sends_stand_aside_without_failing(self, decide, send):
+        with patch.object(bot, 'fetch_bars', return_value=self.bars):
+            self.assertEqual(bot.main(), 0)
+        text = send.call_args.args[0]
+        self.assertIn('STAND ASIDE', text)
+        self.assertNotIn('— BUY', text)
+        self.assertIn('Net R:R', text)
 
     @patch.object(bot, 'send_telegram', return_value=True)
     @patch.object(ai, 'decide', return_value={'action': 'BUY', 'reason': 'Trend.'})
