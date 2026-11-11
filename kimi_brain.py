@@ -26,17 +26,47 @@ MAX_REASON_CHARS = 280
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 90
 
-SYSTEM_PROMPT = (
-    'You are a cautious XAU/USD 15-minute market monitor. Decide BUY, SELL, '
-    'or STAND ASIDE using only the supplied closed-candle data and indicators. '
-    'The rule-based action is reference information, not a binding constraint. '
-    'Do not assume access to live prices, news, spreads, or a trading account. '
-    'Prefer STAND ASIDE when the data does not support a clear setup. '
-    'Return only a JSON object with exactly two string fields: '
-    '"action" (exactly BUY, SELL, or STAND ASIDE) and '
-    '"reason" (one concise explanation, at most 280 characters). '
-    'Do not claim a win probability, guaranteed return, or invent facts.'
-)
+SYSTEM_PROMPT = """You are a cautious XAU/USD scalper reading a 15-minute chart, with an optional
+5-minute confirmation chart. A position is held {hold_min}-{hold_max} minutes and must be
+flat by the end of that window.
+
+You receive only closed candles, indicators, a volatility and cost plan, and
+locally computed strategy scores. You have no live quote, no order book, no
+spread feed, no news and no account. The spread is an assumption, not a
+measurement.
+
+Decide BUY, SELL or STAND ASIDE, applying all of the following:
+
+1. TREND: respect the EMA9/20/50/200 stack and ADX. ADX below 20 means the
+   market is ranging: do not chase breakouts there, and be wary of trend entries.
+2. MOMENTUM: RSI(7), RSI(14), MACD histogram, Stochastic, CCI and Williams %R
+   should agree with the direction. Divergence means the move is late.
+3. LOCATION: only trade at a level - support/resistance, a Bollinger extreme,
+   the 20-bar range edge, or a swing pivot. Mid-range entries are poor scalps.
+4. VOLATILITY: the target must be reachable inside the hold window. Compare
+   target_vs_expected in the plan; above 1.0 the target needs more time than a
+   {hold_max}-minute scalp has. Low ATR percentile means there is nothing to capture.
+5. COST: net_rr is reward:risk after the assumed spread. If net_rr is below
+   {min_rr}, or the spread dominates a small ATR, STAND ASIDE.
+6. CONFIRMATION: prefer setups where at least two local strategies agree on
+   direction, or one scores 4+/5 with a clear confirming candle.
+7. SESSION: thin liquidity makes scalps unreliable. Be stricter when liquidity
+   is low or the market is closed.
+8. Most candles are not trades. If the evidence is mixed, contradicted or
+   missing, STAND ASIDE.
+
+Return only a JSON object with exactly these string/integer fields:
+"action": exactly BUY, SELL or STAND ASIDE
+"reason": one concise explanation of at most 280 characters naming the decisive evidence
+"strategy": the playbook that best fits - trend_pullback, breakout, mean_reversion,
+            momentum_macd, range_fade, or none
+"hold_minutes": integer minutes you expect to hold, between {hold_min} and {hold_max}
+Never claim a win probability or guaranteed profit. No extra fields."""
+
+
+def system_prompt(hold_min: int, hold_max: int, min_net_rr: float) -> str:
+    """Prompt text for the configured scalp profile."""
+    return SYSTEM_PROMPT.format(hold_min=hold_min, hold_max=hold_max, min_rr=f"{min_net_rr:g}")
 
 
 class AIError(Exception):
@@ -103,11 +133,11 @@ def _provider_message(response) -> str:
     return ''
 
 
-def _payload(snapshot: dict, thinking: bool) -> dict:
+def _payload(snapshot: dict, thinking: bool, prompt: str) -> dict:
     payload = {
         'model': current_model(),
         'messages': [
-            {'role': 'system', 'content': SYSTEM_PROMPT},
+            {'role': 'system', 'content': prompt},
             {'role': 'user', 'content': json.dumps(snapshot, allow_nan=False)},
         ],
         'response_format': {'type': 'json_object'},
@@ -143,7 +173,7 @@ def _strip_fence(text: str) -> str:
     return match.group(1).strip() if match else text
 
 
-def _parse(data, attempt: int):
+def _parse(data, attempt: int, bounds=(5, 16)):
     """Return (decision, problem). Exactly one is None-able: decision on success."""
     try:
         choice = data['choices'][0]
@@ -174,8 +204,9 @@ def _parse(data, attempt: int):
         decision = json.loads(text)
     except ValueError:
         return None, 'content was not valid JSON'
-    if not isinstance(decision, dict) or set(decision) != {'action', 'reason'}:
-        return None, 'JSON fields were not exactly action and reason'
+    allowed = {'action', 'reason', 'strategy', 'hold_minutes'}
+    if not isinstance(decision, dict) or not {'action', 'reason'} <= set(decision) <= allowed:
+        return None, 'JSON fields were not exactly action and reason (plus optional strategy/hold_minutes)'
     action, reason = decision['action'], decision['reason']
     if not isinstance(action, str) or action not in ('BUY', 'SELL', 'STAND ASIDE'):
         return None, 'action was not BUY, SELL or STAND ASIDE'
@@ -185,42 +216,150 @@ def _parse(data, attempt: int):
         return None, f'reason longer than {MAX_REASON_CHARS} characters'
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in reason):
         return None, 'reason contained control characters'
-    return {'action': action, 'reason': reason.strip()}, None
+    return {'action': action, 'reason': reason.strip(),
+            'strategy': _strategy(decision.get('strategy')),
+            'hold_minutes': _hold(decision.get('hold_minutes'), bounds)}, None
 
 
-def decide(bars, indicators, symbol):
-    """Call Kimi on a bounded snapshot and strictly validate the decision."""
-    key = os.environ.get('MOONSHOT_API_KEY')
-    if not key:
-        raise AIError('MOONSHOT_API_KEY is not configured')
-    snapshot = {
+def _strategy(value):
+    """Optional label: kept only if it is short, printable text."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > 40:
+        _debug('dropped malformed strategy field')
+        return None
+    text = ''.join(' ' if (ord(ch) < 32 or ord(ch) == 127) else ch for ch in value).strip()
+    return text or None
+
+
+def _hold(value, bounds):
+    """Optional hold estimate: kept only if it is an in-window integer."""
+    low, high = bounds
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        _debug(f'dropped hold_minutes outside {low}-{high}')
+        return None
+    return value
+
+
+def _num(value, digits: int = 2):
+    return _safe_number(value, digits)
+
+
+def _safe_number(value, digits: int = 2):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(v, digits) if v == v and abs(v) != float('inf') else None
+
+
+def build_snapshot(bars, a: dict, symbol: str, lower_tf=None) -> dict:
+    """Bounded, secrets-free view of the market for one scalp decision."""
+    ind = a.get('indicators_full', {})
+    plans = a.get('plans') or {}
+    regime = ('trending' if (ind.get('adx') or 0) >= 25 else
+              'transitional' if (ind.get('adx') or 0) >= 20 else 'ranging/choppy')
+    return {
         'symbol': symbol,
-        'interval': '15min',
+        'trading_style': 'scalp',
+        'chart_interval': '15min',
+        'hold_horizon_minutes': [a.get('hold_min', 5), a.get('hold_max', 16)],
         'bar_start_timezone': 'UTC',
         'last_40_closed_candles': [
             {'start': b.dt, 'open': b.o, 'high': b.h, 'low': b.l, 'close': b.c}
             for b in bars[-40:]
         ],
-        'indicators': {name: indicators[name] for name in
-                       ('price', 'ema20', 'ema50', 'ema200', 'rsi', 'atr', 'hi20', 'lo20')},
-        'rule_based_reference': {'action': indicators['action'],
-                                 'confluence_checks_passed': indicators['confidence'],
-                                 'checks_passed': indicators['reasons']},
+        'last_4_candle_shapes': a.get('candle_shapes', [])[-4:],
+        'trend': {
+            'price': _num(a.get('price')),
+            'ema9': _num(ind.get('ema9')), 'ema20': _num(ind.get('ema20')),
+            'ema50': _num(ind.get('ema50')), 'ema200': _num(ind.get('ema200')),
+            'ema_stack': ('bullish' if ind.get('ema9', 0) > ind.get('ema20', 0) > ind.get('ema50', 0)
+                          else 'bearish' if ind.get('ema9', 0) < ind.get('ema20', 0) < ind.get('ema50', 0)
+                          else 'mixed'),
+            'adx': _num(ind.get('adx'), 1),
+            'plus_di': _num(ind.get('plus_di'), 1), 'minus_di': _num(ind.get('minus_di'), 1),
+            'regime': regime,
+        },
+        'momentum': {
+            'rsi7': _num(ind.get('rsi7'), 1), 'rsi14': _num(ind.get('rsi14'), 1),
+            'macd': _num(ind.get('macd')), 'macd_signal': _num(ind.get('macd_signal')),
+            'macd_hist': _num(ind.get('macd')), 'macd_hist_prev_bars': [
+                _num(ind.get('macd_hist_1_ago')), _num(ind.get('macd_hist_2_ago'))],
+            'stoch_k': _num(ind.get('stoch_k'), 1), 'stoch_d': _num(ind.get('stoch_d'), 1),
+            'cci': _num(ind.get('cci'), 1), 'williams_r': _num(ind.get('williams_r'), 1),
+        },
+        'volatility': {
+            'atr_15m': _num(a.get('atr')),
+            'atr_percentile_100bars': _num(ind.get('atr_percentile'), 1),
+            'atr_pct_of_price': _num(ind.get('atr_pct_of_price'), 3),
+            'expected_move_usd_at_hold_max': _num(
+                (plans.get('BUY') or {}).get('expected_move_usd')),
+        },
+        'levels': {
+            'bar_20_high': _num(a.get('hi20')), 'bar_20_low': _num(a.get('lo20')),
+            'bollinger_upper': _num(a.get('bb_up')), 'bollinger_lower': _num(a.get('bb_lo')),
+            'bollinger_pct_b': _num(a.get('bb_pctb'), 3),
+            'nearest_resistance': _num(a.get('nearest_resistance')),
+            'nearest_support': _num(a.get('nearest_support')),
+            'recent_swing_levels': [{'kind': lvl['kind'], 'price': _num(lvl['price'])}
+                                    for lvl in (a.get('levels') or [])],
+        },
+        'session': a.get('session', {}),
+        'cost_and_plan': {
+            'assumed_spread_usd_per_oz': _num(a.get('spread')),
+            'hold_minutes': [a.get('hold_min', 5), a.get('hold_max', 16)],
+            'min_net_reward_risk_required': _num(a.get('min_net_rr'), 2),
+            'plan_if_buy': _plan(plans.get('BUY')),
+            'plan_if_sell': _plan(plans.get('SELL')),
+        },
+        'local_strategy_scores': a.get('strategies', []),
+        'rule_based_reference': {'action': a.get('action'),
+                                 'confluence_checks_passed': a.get('confidence'),
+                                 'checks_passed': a.get('reasons', [])},
+        **({'lower_timeframe_5min': lower_tf} if lower_tf else {}),
     }
+
+
+def _plan(plan: dict | None) -> dict | None:
+    if not plan:
+        return None
+    return {
+        'stop': _num(plan.get('stop')),
+        'target': _num(plan.get('target')),
+        'risk_usd': _num(plan.get('risk_usd')),
+        'reward_usd': _num(plan.get('reward_usd')),
+        'net_reward_risk_after_spread': _num(plan.get('net_rr')),
+        'target_vs_expected_move': _num(plan.get('target_vs_expected'), 2),
+        'passes_cost_gate': plan.get('passes_cost_gate'),
+    }
+
+
+def decide(bars, analysis: dict, symbol: str, lower_tf=None):
+    """Call Kimi on a bounded snapshot and strictly validate the decision."""
+    key = os.environ.get('MOONSHOT_API_KEY')
+    if not key:
+        raise AIError('MOONSHOT_API_KEY is not configured')
+    snapshot = build_snapshot(bars, analysis, symbol, lower_tf)
+    prompt = system_prompt(analysis.get('hold_min', 5), analysis.get('hold_max', 16),
+                           analysis.get('min_net_rr', 1.0))
+    bounds = (analysis.get('hold_min', 5), analysis.get('hold_max', 16))
     # First attempt uses thinking (if enabled); a retry drops thinking, which is
     # cheaper, faster and avoids the shared reasoning/content token budget.
     attempts = [True, False] if _env_flag('KIMI_THINKING', True) else [False]
     problem = 'no usable decision'
     for index, thinking in enumerate(attempts, start=1):
         try:
-            data = _post(_payload(snapshot, thinking), key, index)
+            data = _post(_payload(snapshot, thinking, prompt), key, index)
         except AIError as e:
             if e.retriable and index < len(attempts):
                 _debug(f'attempt {index} failed ({e}); retrying without thinking')
                 problem = str(e)
                 continue
             raise
-        decision, failure = _parse(data, index)
+        decision, failure = _parse(data, index, bounds)
         if decision is not None:
             return decision
         problem = failure

@@ -35,6 +35,14 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MIN_CONF: "4"
+          # --- Scalp profile (see README). Empty values fall back to defaults. ---
+          HOLD_MIN: ${{ vars.HOLD_MIN }}          # default 5 minutes
+          HOLD_MAX: ${{ vars.HOLD_MAX }}          # default 16 minutes
+          SPREAD_USD: ${{ vars.SPREAD_USD }}      # default 0.40 USD/oz
+          MIN_NET_RR: ${{ vars.MIN_NET_RR }}      # default 1.0 after costs
+          ATR_SL: ${{ vars.ATR_SL }}              # default 0.5 x ATR
+          ATR_TP: ${{ vars.ATR_TP }}              # default 0.75 x ATR
+          USE_M5: ${{ vars.USE_M5 }}              # default 1 (5m confirmation)
           # Optional repository variables (Settings -> Secrets and variables ->
           # Actions -> Variables). An empty value falls back to the default.
           KIMI_MODEL: ${{ vars.KIMI_MODEL }}

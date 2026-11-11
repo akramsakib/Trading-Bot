@@ -1,8 +1,13 @@
-# Gold (XAU/USD) 15-Minute AI Signal Monitor
+# Gold (XAU/USD) 15-Minute AI Scalp Signal Monitor
 
 This experimental GitHub Actions bot fetches 15-minute gold candles, asks
 **Kimi K2.6** to choose BUY, SELL, or STAND ASIDE, and sends the result to
 Telegram. It does **not** place trades or connect to a broker.
+
+It is tuned for **scalping: a 5–16 minute hold, closed out inside the same
+15-minute candle or the next one.** Levels are fractions of the 15-minute ATR,
+costs are part of the maths, and the AI must justify the trade against trend,
+momentum, volatility, location, session and cost.
 
 **The AI strategy has not been backtested or proven profitable.** AI can make
 mistakes, invent explanations, or change its answer for the same data. Paper
@@ -12,17 +17,29 @@ trade and independently verify signals before considering any real-money use.
 
 1. Twelve Data supplies candles. The bot requests UTC, assumes timestamps are
    candle start times, and uses only candles at least two minutes past closing.
-2. Code calculates RSI, ATR, EMA20/50/200, a prior 20-bar range and the original
-   rule-based reference. Kimi receives those values plus the last 40 closed
-   OHLC candles. It has no live quote, news, account information, or tools.
-3. Kimi chooses the final action. It can disagree with the rule-based reference,
-   including choosing BUY or SELL when the rules say STAND ASIDE. The rule
-   score is **not** a probability. `MIN_CONF` affects only the reference, not
-   the AI's decision.
-4. For BUY/SELL, the code (not the AI) calculates illustrative stop and target
-   levels at 1.5×ATR and 2×ATR from the last close. These are not executable
-   quotes; spreads, slippage, and delayed delivery change real risk and reward.
-5. Invalid or incomplete AI output, a missing key, timeouts, or data that
+2. Code calculates a scalping indicator set locally: EMA 9/20/50/200, RSI(7)
+   and RSI(14), ATR(14) with its 100-bar percentile, MACD(12,26,9), Bollinger
+   (20,2) with %B, Stochastic(14,3,3), ADX/+DI/−DI, CCI(20), Williams %R,
+   candle anatomy (body and wick ratios), fractal swing levels, the 20-bar
+   range, and the UTC session. When available, a 5-minute series is fetched as
+   an entry-timing confirmation.
+3. Five short-term playbooks are scored mechanically from the same candles:
+   `trend_pullback`, `breakout`, `mean_reversion`, `momentum_macd` and
+   `range_fade`. Each returns a direction and a 0–5 score. These are readings,
+   **not evidence of an edge**.
+4. Kimi receives all of that plus the last 40 closed OHLC candles and chooses
+   the final action. It can disagree with the rule-based reference, including
+   choosing BUY or SELL when the rules say STAND ASIDE. The rule score is
+   **not** a probability. `MIN_CONF` affects only the reference, not the AI's
+   decision.
+5. For BUY/SELL, the code (not the AI) sizes the scalp: stop at
+   `ATR_SL`×ATR (default 0.5) and target at `ATR_TP`×ATR (default 0.75) from
+   the last close — a few dollars, not a swing move. The plan is rejected as a
+   deliberate STAND ASIDE when the assumed spread leaves reward:risk below
+   `MIN_NET_RR` (default 1.0), or when the target would need more than the
+   remaining hold window. These are not executable quotes; spreads, slippage,
+   and delayed delivery change real risk and reward.
+6. Invalid or incomplete AI output, a missing key, timeouts, or data that
    becomes stale while waiting result in STAND ASIDE rather than falling back
    to a rule-based trade. The run fails so the problem is visible in Actions.
    A stale feed or market closure also produces STAND ASIDE without calling AI;
@@ -55,7 +72,24 @@ API keys and Telegram details are not included in the AI prompt.
    | `TELEGRAM_CHAT_ID` | Telegram chat ID |
 
    Never paste keys into source code, commits, public logs, or chat.
-4. Deploy these changes to the repository's default branch. GitHub scheduled
+4. Optional: tune the scalp profile with repository **variables** (Settings →
+   Secrets and variables → Actions → Variables). An empty value falls back to
+   the default.
+
+   | Variable | Default | Meaning |
+   |---|---|---|
+   | `HOLD_MIN` / `HOLD_MAX` | `5` / `16` | Hold window in minutes; the position must be flat by `HOLD_MAX`. |
+   | `ATR_SL` / `ATR_TP` | `0.5` / `0.75` | Stop and target as a fraction of the 15m ATR. |
+   | `SPREAD_USD` | `0.40` | Your round-trip cost in USD per ounce. **Set this to your broker's real spread** — it decides whether a scalp is worth taking. |
+   | `MIN_NET_RR` | `1.0` | Minimum reward:risk after the spread. Below this, the run reports STAND ASIDE. |
+   | `USE_M5` | `1` | `0` skips the 5-minute confirmation series (one less API credit per run). |
+   | `MIN_CONF` | `4` | Confluence needed for the *rule-based reference* only. |
+
+   With the defaults and a $3–5 spread-free ATR the gate blocks dead markets;
+   at the ATR levels in the sample data (~$8.7 median) it passes almost always.
+   A 0.5×ATR stop on gold is a few dollars — if your broker's spread is $1.00,
+   set `SPREAD_USD=1.0` and expect many more STAND ASIDE messages.
+5. Deploy these changes to the repository's default branch. GitHub scheduled
    workflows use that branch's workflow file. Enable **Gold 15m Signal** in the
    Actions tab if it is disabled. For a manual check, use **Run workflow** and
    select the branch containing these changes. Start with paper trading.
@@ -68,7 +102,9 @@ revise data. A candle older than 30 minutes after close is considered stale.
 ## Cost and limitations
 
 A run with fresh market data makes **one paid Kimi request**, potentially 96
-requests per day. Thinking mode is on by default and reasoning tokens share the
+requests per day, and **two Twelve Data requests** (15-minute and optional
+5-minute series), potentially 192 credits per day — check your Twelve Data plan
+limit and the 8-credits-per-minute rate limit if you shorten the schedule. Thinking mode is on by default and reasoning tokens share the
 `max_tokens` budget (16,384 by default), so a slow or verbose answer can cost
 more than a non-thinking call. Check Moonshot's current pricing, quotas, and
 your account's spend controls before enabling the schedule. AI requests have a
@@ -124,6 +160,8 @@ Variables**, or workflow `env`) tune the call without a code change:
 
 - `signal.py`: data validation, indicators, local risk levels and Telegram.
 - `kimi_brain.py`: Kimi request and strict response validation.
+- `research/scalp_profile_notes.md`: how the scalp sizing behaves on one
+  historical sample (not a backtest of the AI).
 - `.github/workflows/gold-signal.yml`: schedule and secret wiring.
 - `tests/`: mocked API and safety checks.
 - `research/`: original rule-based backtest and its assumptions.
