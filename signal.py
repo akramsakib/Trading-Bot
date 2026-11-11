@@ -297,7 +297,7 @@ def format_ai_message(s: dict, decision: dict) -> str:
     icon = {"BUY": "🟢", "SELL": "🔴"}.get(action, "⚪")
     lines = [
         f"{icon} GOLD {SYMBOL} — {action}",
-        f"AI decision: {kimi_brain.KIMI_MODEL}",
+        f"AI decision: {kimi_brain.current_model()}",
         f"15m bar start: {s['bar_time']} UTC (closed)",
         f"Reference close {s['price']:.2f} (not a live quote)",
         f"RSI {s['rsi']:.1f}   ATR {s['atr']:.2f}",
