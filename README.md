@@ -40,6 +40,8 @@ API keys and Telegram details are not included in the AI prompt.
    This integration uses `https://api.moonshot.ai/v1` and `kimi-k2.6` in
    thinking mode. An Arena API key is **not** used or interchangeable with a
    Moonshot key. Make sure your account has access and sufficient API credit.
+   Note that Moonshot plans to retire the K2 series by the end of December
+   2026; `kimi-k3` and `kimi-k3.1-pro` are the current replacements.
 2. Create a Telegram bot with @BotFather and send it a message. Obtain its chat
    ID through Telegram's `getUpdates` endpoint. Keep the bot token private.
 3. In the GitHub repository, open **Settings → Secrets and variables → Actions
@@ -66,10 +68,12 @@ revise data. A candle older than 30 minutes after close is considered stale.
 ## Cost and limitations
 
 A run with fresh market data makes **one paid Kimi request**, potentially 96
-requests per day, with up to 2,048 output/reasoning tokens per request. Check
-Moonshot's current pricing, quotas, and your account's spend controls before
-enabling the schedule. AI requests have a 90-second read timeout. No Kimi call
-is made for stale market data.
+requests per day. Thinking mode is on by default and reasoning tokens share the
+`max_tokens` budget (16,384 by default), so a slow or verbose answer can cost
+more than a non-thinking call. Check Moonshot's current pricing, quotas, and
+your account's spend controls before enabling the schedule. AI requests have a
+90-second read timeout, and one retry without thinking is allowed on a timeout,
+a 5xx error, or an unusable answer. No Kimi call is made for stale market data.
 
 Prices may differ from your broker's bid/ask and candle timestamps. Stop/target
 levels, execution assumptions, and a historical reference close are not actual
@@ -91,6 +95,30 @@ python -m unittest discover -s research -p 'test_*.py' -v
 The prior [historical backtest](research/backtest_report.md) evaluates **only
 the old deterministic rules**, not Kimi. It cannot establish the performance
 of the new AI strategy.
+
+## If the Kimi step fails
+
+The run logs `[kimi-debug]` lines (model, thinking mode, `max_tokens`, HTTP
+status, `finish_reason`, token usage) with secrets removed. The error text
+names the cause, for example:
+
+| Log line | Meaning |
+|---|---|
+| `finish_reason=length (answer truncated by max_tokens)` | Reasoning used the whole token budget — raise `KIMI_MAX_TOKENS`. |
+| `only reasoning was returned, content was empty` | Same cause; the retry without thinking also failed. |
+| `Kimi returned HTTP 401` / `403` | Key missing, wrong, or out of credit — check `MOONSHOT_API_KEY`. |
+| `Kimi returned HTTP 404: ...` | Model name not available to your account. |
+| `Kimi request failed or timed out` | Network or a slow thinking response; one retry is attempted. |
+
+Optional repository variables (**Settings → Secrets and variables → Actions →
+Variables**, or workflow `env`) tune the call without a code change:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `KIMI_MODEL` | `kimi-k2.6` | Any model your key can call, e.g. `kimi-k3`. |
+| `KIMI_MAX_TOKENS` | `16384` | Reasoning + answer budget (512–65536). |
+| `KIMI_THINKING` | on | `off` disables reasoning: faster, cheaper, less deliberate. |
+| `KIMI_DEBUG` | `0` | `1` prints the sanitised diagnostics above. |
 
 ## Files
 

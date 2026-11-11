@@ -35,4 +35,11 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MIN_CONF: "4"
+          # Optional repository variables (Settings -> Secrets and variables ->
+          # Actions -> Variables). An empty value falls back to the default.
+          KIMI_MODEL: ${{ vars.KIMI_MODEL }}
+          KIMI_MAX_TOKENS: ${{ vars.KIMI_MAX_TOKENS }}
+          KIMI_THINKING: ${{ vars.KIMI_THINKING }}
+          # Prints sanitised Kimi diagnostics (status, finish_reason, token use).
+          KIMI_DEBUG: "1"
         run: python signal.py

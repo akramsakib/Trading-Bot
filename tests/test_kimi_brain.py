@@ -1,6 +1,8 @@
+import io
 import json
 import os
 import unittest
+from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
@@ -11,6 +13,19 @@ from test_signal import bot
 def answer(action='BUY', reason='The short trend is rising.'):
     return {'choices': [{'finish_reason': 'stop',
                          'message': {'content': json.dumps({'action': action, 'reason': reason})}}]}
+
+
+def body(action='BUY', reason='The short trend is rising.', finish='stop', reasoning=''):
+    """Raw provider payload; optionally simulating a thinking-model response."""
+    return {'choices': [{'finish_reason': finish,
+                         'message': {'content': json.dumps({'action': action, 'reason': reason}),
+                                     'reasoning_content': reasoning}}]}
+
+
+def truncated():
+    """What a starved max_tokens budget looks like: reasoning, no content."""
+    return {'choices': [{'finish_reason': 'length',
+                         'message': {'content': '', 'reasoning_content': 'thinking...'}}]}
 
 
 class KimiTests(unittest.TestCase):
@@ -31,6 +46,9 @@ class KimiTests(unittest.TestCase):
         self.assertEqual(args[0], 'https://api.moonshot.ai/v1/chat/completions')
         self.assertFalse(kwargs['allow_redirects'])
         self.assertEqual(kwargs['json']['model'], 'kimi-k2.6')
+        # Reasoning tokens share this budget; Kimi recommends >= 16000.
+        self.assertGreaterEqual(kwargs['json']['max_tokens'], 16000)
+        self.assertEqual(kwargs['json']['thinking'], {'type': 'enabled'})
         self.assertEqual(len(json.loads(kwargs['json']['messages'][1]['content'])['last_40_closed_candles']), 40)
         self.assertNotIn('test-secret', json.dumps(kwargs['json']))
 
@@ -101,6 +119,113 @@ class KimiTests(unittest.TestCase):
         with patch.object(bot, 'fetch_bars', return_value=self.bars):
             self.assertEqual(bot.main(), 1)
         self.assertIn('STAND ASIDE', send.call_args.args[0])
+
+    # ------------------------------------------------------------------ #
+    # Kimi request/response handling
+    # ------------------------------------------------------------------ #
+
+    @patch.dict(os.environ, {'MOONSHOT_API_KEY': 'test-secret'})
+    @patch.object(ai.requests, 'post')
+    def test_truncated_thinking_answer_retries_without_thinking(self, post):
+        post.side_effect = [Mock(ok=True, status_code=200, json=Mock(return_value=truncated())),
+                            Mock(ok=True, status_code=200, json=Mock(return_value=answer('SELL')))]
+        self.assertEqual(ai.decide(self.bars, self.info, 'XAU/USD')['action'], 'SELL')
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_args_list[0].kwargs['json']['thinking'], {'type': 'enabled'})
+        self.assertEqual(post.call_args_list[1].kwargs['json']['thinking'], {'type': 'disabled'})
+
+    @patch.dict(os.environ, {'MOONSHOT_API_KEY': 'test-secret', 'KIMI_THINKING': 'off'})
+    @patch.object(ai.requests, 'post')
+    def test_thinking_disabled_makes_one_attempt(self, post):
+        post.return_value = Mock(ok=True, status_code=200, json=Mock(return_value=truncated()))
+        with self.assertRaises(ai.AIError) as e:
+            ai.decide(self.bars, self.info, 'XAU/USD')
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(post.call_args.kwargs['json']['thinking'], {'type': 'disabled'})
+        self.assertIn('truncated', str(e.exception))
+
+    @patch.dict(os.environ, {'MOONSHOT_API_KEY': 'test-secret', 'KIMI_MODEL': 'kimi-k3',
+                             'KIMI_MAX_TOKENS': '8192'})
+    @patch.object(ai.requests, 'post')
+    def test_env_overrides_model_and_token_budget(self, post):
+        post.return_value = Mock(ok=True, status_code=200, json=Mock(return_value=answer()))
+        ai.decide(self.bars, self.info, 'XAU/USD')
+        payload = post.call_args.kwargs['json']
+        self.assertEqual(payload['model'], 'kimi-k3')
+        self.assertEqual(payload['max_tokens'], 8192)
+        self.assertEqual(ai.current_model(), 'kimi-k3')
+
+    @patch.dict(os.environ, {'MOONSHOT_API_KEY': 'test-secret'})
+    @patch.object(ai.requests, 'post')
+    def test_code_fenced_json_is_accepted(self, post):
+        fenced = {'choices': [{'finish_reason': 'stop',
+                               'message': {'content': '```json\n{"action": "BUY", "reason": "Uptrend."}\n```'}}]}
+        post.return_value = Mock(ok=True, status_code=200, json=Mock(return_value=fenced))
+        self.assertEqual(ai.decide(self.bars, self.info, 'XAU/USD')['action'], 'BUY')
+
+    @patch.dict(os.environ, {'MOONSHOT_API_KEY': 'test-secret'})
+    @patch.object(ai.requests, 'post')
+    def test_http_error_reports_provider_message(self, post):
+        post.return_value = Mock(ok=False, status_code=400, text='',
+                                 json=Mock(return_value={'error': {'message': 'unknown model'}}))
+        with self.assertRaises(ai.AIError) as e:
+            ai.decide(self.bars, self.info, 'XAU/USD')
+        self.assertIn('HTTP 400', str(e.exception))
+        self.assertIn('unknown model', str(e.exception))
+        self.assertEqual(post.call_count, 1)  # 4xx is not retried
+
+    @patch.dict(os.environ, {'MOONSHOT_API_KEY': 'test-secret'})
+    @patch.object(ai.requests, 'post')
+    def test_server_error_is_retried(self, post):
+        post.side_effect = [Mock(ok=False, status_code=500, text='',
+                                 json=Mock(return_value={'error': {'message': 'upstream failure'}})),
+                            Mock(ok=True, status_code=200, json=Mock(return_value=answer('SELL')))]
+        self.assertEqual(ai.decide(self.bars, self.info, 'XAU/USD')['action'], 'SELL')
+        self.assertEqual(post.call_count, 2)
+
+    @patch.dict(os.environ, {'MOONSHOT_API_KEY': 'test-secret'})
+    @patch.object(ai.requests, 'post')
+    def test_timeout_is_retried_without_thinking(self, post):
+        post.side_effect = [ai.requests.RequestException('timeout'),
+                            Mock(ok=True, status_code=200, json=Mock(return_value=answer('STAND ASIDE')))]
+        self.assertEqual(ai.decide(self.bars, self.info, 'XAU/USD')['action'], 'STAND ASIDE')
+        self.assertEqual(post.call_args.kwargs['json']['thinking'], {'type': 'disabled'})
+
+    @patch.dict(os.environ, {'MOONSHOT_API_KEY': 'test-secret', 'KIMI_DEBUG': '1'})
+    @patch.object(ai.requests, 'post')
+    def test_debug_output_is_useful_and_leaks_nothing(self, post):
+        post.return_value = Mock(ok=True, status_code=200,
+                                 json=Mock(return_value=body(reasoning='step one', finish='stop')))
+        stream = io.StringIO()
+        with redirect_stderr(stream):
+            ai.decide(self.bars, self.info, 'XAU/USD')
+        text = stream.getvalue()
+        self.assertIn('finish_reason', text)
+        self.assertIn('max_tokens', text)
+        self.assertNotIn('test-secret', text)
+        self.assertNotIn('Bearer', text)
+
+    @patch.dict(os.environ, {'MOONSHOT_API_KEY': 'test-secret'})
+    @patch.object(ai.requests, 'post')
+    def test_failure_detail_names_the_cause(self, post):
+        cases = [
+            (truncated(), 'truncated'),
+            ({'choices': [{'finish_reason': 'stop', 'message': {'content': '',
+                                                                'reasoning_content': 'thinking'}}]},
+             'only reasoning'),
+            ({'choices': [{'finish_reason': 'stop', 'message': {'content': '{"action":"HOLD"}'}}]},
+             'exactly action and reason'),
+            ({'choices': [{'finish_reason': 'stop',
+                           'message': {'content': '{"action":"HOLD","reason":"x"}'}}]},
+             'action was not BUY'),
+            ({'choices': []}, 'no choices'),
+        ]
+        for response, expected in cases:
+            post.return_value = Mock(ok=True, status_code=200, json=Mock(return_value=response))
+            with self.subTest(expected=expected), self.assertRaises(ai.AIError) as e:
+                ai.decide(self.bars, self.info, 'XAU/USD')
+            self.assertIn(expected, str(e.exception))
+
 
 if __name__ == '__main__':
     unittest.main()
