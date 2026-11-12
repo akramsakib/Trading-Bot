@@ -756,6 +756,13 @@ def format_message(s: dict) -> str:
     return "\n".join(lines)
 
 
+def fmt_cause(error: Exception, limit: int = 120) -> str:
+    """Short, sanitised failure cause for Telegram (one line, no newlines)."""
+    text = " ".join(str(error).split())
+    text = "".join(ch for ch in text if ord(ch) >= 32 and ord(ch) != 127)
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
 def fmt(value, spec: str = ".2f", fallback: str = "n/a") -> str:
     """Format a number for Telegram; NaN/inf/None become n/a."""
     v = safe_num(value, 4)
@@ -894,7 +901,12 @@ def main() -> int:
                 raise kimi_brain.AIError("market data became stale while waiting for AI")
         except kimi_brain.AIError as e:
             print(f"[ERROR] {e}", file=sys.stderr)
-            send_telegram(f"⚪ {SYMBOL} — STAND ASIDE\nAI unavailable or invalid; no trading signal generated. Check workflow logs.")
+            # The cause is safe to show: AIError never carries keys, URLs or
+            # provider payloads, and it is the only way to diagnose a run
+            # without opening the Actions log.
+            send_telegram(f"⚪ {SYMBOL} — STAND ASIDE\n"
+                          f"AI unavailable or invalid; no trading signal generated.\n"
+                          f"Cause: {fmt_cause(e)}")
             return 1
 
         strategy = decision.get("strategy") or "-"
