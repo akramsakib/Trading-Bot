@@ -138,6 +138,10 @@ The run logs `[kimi-debug]` lines (model, thinking mode, `max_tokens`, HTTP
 status, `finish_reason`, token usage) with secrets removed. The error text
 names the cause, for example:
 
+The STAND ASIDE message on Telegram now carries a `Cause:` line with the same
+sanitised text, so you can see why a run produced no signal without opening the
+Actions log.
+
 | Log line | Meaning |
 |---|---|
 | `finish_reason=length (answer truncated by max_tokens)` | Reasoning used the whole token budget — raise `KIMI_MAX_TOKENS`. |

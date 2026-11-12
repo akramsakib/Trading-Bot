@@ -56,11 +56,13 @@ class KimiTests(unittest.TestCase):
     @patch.dict(os.environ, {'MOONSHOT_API_KEY': 'test-secret'})
     @patch.object(ai.requests, 'post')
     def test_invalid_answers_fail_closed(self, post):
-        bad = [answer('HOLD'), answer('BUY', ''), answer('BUY', 'x'*281),
+        # Extra fields, synonyms and casing are accepted now; these are not.
+        bad = [answer('MAYBE'), answer('BUY', ''), answer('BUY', 'x'*281),
                answer('SELL', 'one\ntwo'), {'choices': []},
                {'choices': [{'finish_reason': 'length', 'message': {'content': '{}'}}]},
                {'choices': [{'finish_reason': 'stop', 'message': {'content': 'not json'}}]},
-               {'choices': [{'finish_reason': 'stop', 'message': {'content': '{"action":"BUY","reason":"x","extra":1}'}}]}]
+               {'choices': [{'finish_reason': 'stop',
+                             'message': {'content': '{"action": 5, "reason": "x"}'}}]}]
         for response in bad:
             post.return_value = Mock(ok=True, status_code=200, json=Mock(return_value=response))
             with self.subTest(response=response), self.assertRaises(ai.AIError):
@@ -136,6 +138,13 @@ class ScalpPlanAndCostTests(unittest.TestCase):
                              100 + i/100, 102 + i/100, 99 + i/100, 101 + i/100)
                      for i in range(300)]
         self.info = bot.analyse(self.bars)
+
+    def test_snapshot_macd_histogram_is_not_the_macd_line(self):
+        snap = bot.kimi_brain.build_snapshot(self.bars, self.info, 'XAU/USD')
+        momentum = snap['momentum']
+        self.assertAlmostEqual(momentum['macd_hist'],
+                               round(momentum['macd'] - momentum['macd_signal'], 2), places=1)
+        self.assertIsNotNone(momentum['macd_hist_prev_bars'][0])
 
     def test_scalp_levels_are_fractions_of_atr(self):
         plan = bot.scalp_plan(self.info['price'], self.info['atr'], 1)
@@ -314,16 +323,69 @@ class ScalpPlanAndCostTests(unittest.TestCase):
 
     @patch.dict(os.environ, {'MOONSHOT_API_KEY': 'test-secret'})
     @patch.object(ai.requests, 'post')
+    def test_harmless_model_variation_is_still_read(self, post):
+        """A usable verdict must not be thrown away over formatting."""
+        cases = [
+            ('extra fields ignored', {'action': 'BUY', 'reason': 'Trend.', 'confidence': 'high',
+                                      'entry': 4415.3, 'stop_loss': 4411.7}, 'BUY'),
+            ('lowercase action', {'action': 'buy', 'reason': 'Trend.'}, 'BUY'),
+            ('padded and underscored', {'action': ' stand_aside ', 'reason': 'Chop.'}, 'STAND ASIDE'),
+            ('synonym hold', {'action': 'HOLD', 'reason': 'Chop.'}, 'STAND ASIDE'),
+            ('numeric string hold', {'action': 'SELL', 'reason': 'Trend.', 'hold_minutes': '12'}, 'SELL'),
+            ('float hold', {'action': 'SELL', 'reason': 'Trend.', 'hold_minutes': 12.0}, 'SELL'),
+            ('nested object', {'decision': {'action': 'BUY', 'reason': 'Trend.'}}, 'BUY'),
+            ('prose around json', None, 'BUY'),
+        ]
+        for label, payload, expected in cases:
+            if payload is None:
+                content = 'Sure! Here is my decision:\n{"action": "BUY", "reason": "Trend."}\nHope that helps.'
+            else:
+                content = json.dumps(payload)
+            post.return_value = Mock(ok=True, status_code=200, json=Mock(return_value={
+                'choices': [{'finish_reason': 'stop', 'message': {'content': content}}]}))
+            with self.subTest(label):
+                self.assertEqual(ai.decide(self.bars, self.info, 'XAU/USD')['action'], expected)
+
+    @patch.dict(os.environ, {'MOONSHOT_API_KEY': 'test-secret'})
+    @patch.object(ai.requests, 'post')
+    def test_optional_fields_are_kept_when_valid(self, post):
+        post.return_value = Mock(ok=True, status_code=200, json=Mock(return_value={
+            'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps(
+                {'action': 'BUY', 'reason': 'Trend.', 'strategy': 'breakout',
+                 'hold_minutes': 11, 'confidence': 0.7})}}]}))
+        decision = ai.decide(self.bars, self.info, 'XAU/USD')
+        self.assertEqual(decision['strategy'], 'breakout')
+        self.assertEqual(decision['hold_minutes'], 11)
+        self.assertNotIn('confidence', decision)
+
+    @patch.dict(os.environ, {'MOONSHOT_API_KEY': 'test-secret'})
+    @patch.object(ai.requests, 'post')
+    def test_rate_limit_is_retried(self, post):
+        post.side_effect = [Mock(ok=False, status_code=429, text='',
+                                 json=Mock(return_value={'error': {'message': 'rate limited'}})),
+                            Mock(ok=True, status_code=200, json=Mock(return_value=answer('BUY')))]
+        self.assertEqual(ai.decide(self.bars, self.info, 'XAU/USD')['action'], 'BUY')
+        self.assertEqual(post.call_count, 2)
+
+    def test_failure_cause_is_short_and_printable(self):
+        cause = bot.fmt_cause(ai.AIError('Kimi returned HTTP 429: rate limited\nfor now'))
+        self.assertEqual(cause, 'Kimi returned HTTP 429: rate limited for now')
+        self.assertNotIn('\n', cause)
+        self.assertLessEqual(len(cause), 120)
+        self.assertEqual(bot.fmt_cause(ai.AIError('x' * 500))[-3:], '...')
+
+    @patch.dict(os.environ, {'MOONSHOT_API_KEY': 'test-secret'})
+    @patch.object(ai.requests, 'post')
     def test_failure_detail_names_the_cause(self, post):
         cases = [
             (truncated(), 'truncated'),
             ({'choices': [{'finish_reason': 'stop', 'message': {'content': '',
                                                                 'reasoning_content': 'thinking'}}]},
              'only reasoning'),
-            ({'choices': [{'finish_reason': 'stop', 'message': {'content': '{"action":"HOLD"}'}}]},
-             'exactly action and reason'),
+            ({'choices': [{'finish_reason': 'stop', 'message': {'content': '{"action":"BUY"}'}}]},
+             'reason was empty or missing'),
             ({'choices': [{'finish_reason': 'stop',
-                           'message': {'content': '{"action":"HOLD","reason":"x"}'}}]},
+                           'message': {'content': '{"action":"MAYBE","reason":"x"}'}}]},
              'action was not BUY'),
             ({'choices': []}, 'no choices'),
         ]

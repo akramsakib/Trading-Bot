@@ -161,11 +161,34 @@ def _post(payload: dict, key: str, attempt: int) -> dict:
         detail = _provider_message(response)
         status = response.status_code
         text = f'Kimi returned HTTP {status}' + (f': {detail}' if detail else '')
-        raise AIError(text, retriable=status >= 500)
+        # 429 = rate limited, 408 = timed out server-side: worth one retry.
+        raise AIError(text, retriable=status >= 500 or status in (408, 429))
     try:
         return response.json()
     except ValueError:
         raise AIError(f'Kimi returned a non-JSON HTTP {response.status_code} response') from None
+
+
+def _load_json(text: str):
+    """Parse the object, tolerating prose before or after it."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    start, depth = None, 0
+    for index, char in enumerate(text):
+        if char == '{':
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == '}' and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    return json.loads(text[start:index + 1])
+                except ValueError:
+                    start = None
+    return None
 
 
 def _strip_fence(text: str) -> str:
@@ -200,18 +223,39 @@ def _parse(data, attempt: int, bounds=(5, 16)):
     text = _strip_fence(content.strip())
     if len(text) > MAX_CONTENT_CHARS:
         return None, f'content longer than {MAX_CONTENT_CHARS} characters'
-    try:
-        decision = json.loads(text)
-    except ValueError:
+    decision = _load_json(text)
+    if decision is None:
         return None, 'content was not valid JSON'
-    allowed = {'action', 'reason', 'strategy', 'hold_minutes'}
-    if not isinstance(decision, dict) or not {'action', 'reason'} <= set(decision) <= allowed:
-        return None, 'JSON fields were not exactly action and reason (plus optional strategy/hold_minutes)'
-    action, reason = decision['action'], decision['reason']
-    if not isinstance(action, str) or action not in ('BUY', 'SELL', 'STAND ASIDE'):
-        return None, 'action was not BUY, SELL or STAND ASIDE'
+    if not isinstance(decision, dict):
+        return None, 'JSON was not an object'
+    if 'action' not in decision:
+        # Some models wrap the answer, e.g. {"decision": {"action": ...}}.
+        for value in decision.values():
+            if isinstance(value, dict) and 'action' in value:
+                _debug('unwrapped a nested decision object')
+                decision = value
+                break
+    # Unknown extra fields (confidence, entry, stop_loss...) are ignored rather
+    # than rejected: models routinely add them, and refusing to read the answer
+    # over a harmless extra key turns a good decision into a missed signal.
+    known = {'action', 'reason', 'strategy', 'hold_minutes'}
+    extra = sorted(set(decision) - known)
+    if extra:
+        _debug(f'ignoring extra fields: {extra}')
+    action = _action(decision.get('action'))
+    if action is None:
+        raw = decision.get('action')
+        return None, (f'action was not BUY, SELL or STAND ASIDE (got {_safe(raw, 30)!r})')
+    reason = decision.get('reason')
+    if reason is None:
+        # Some models rename this field; only an exact synonym is accepted.
+        for alias in ('explanation', 'rationale', 'justification'):
+            if isinstance(decision.get(alias), str):
+                reason = decision[alias]
+                _debug(f"used '{alias}' as the reason")
+                break
     if not isinstance(reason, str) or not reason.strip():
-        return None, 'reason was empty'
+        return None, 'reason was empty or missing'
     if len(reason) > MAX_REASON_CHARS:
         return None, f'reason longer than {MAX_REASON_CHARS} characters'
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in reason):
@@ -219,6 +263,24 @@ def _parse(data, attempt: int, bounds=(5, 16)):
     return {'action': action, 'reason': reason.strip(),
             'strategy': _strategy(decision.get('strategy')),
             'hold_minutes': _hold(decision.get('hold_minutes'), bounds)}, None
+
+
+_ACTION_ALIASES = {
+    'BUY': 'BUY', 'LONG': 'BUY', 'CALL': 'BUY',
+    'SELL': 'SELL', 'SHORT': 'SELL', 'PUT': 'SELL',
+    'STAND ASIDE': 'STAND ASIDE', 'STAND_ASIDE': 'STAND ASIDE', 'STANDASIDE': 'STAND ASIDE',
+    'HOLD': 'STAND ASIDE', 'WAIT': 'STAND ASIDE', 'NEUTRAL': 'STAND ASIDE',
+    'NONE': 'STAND ASIDE', 'NO TRADE': 'STAND ASIDE', 'NO_TRADE': 'STAND ASIDE',
+    'FLAT': 'STAND ASIDE', 'SKIP': 'STAND ASIDE',
+}
+
+
+def _action(value):
+    """Normalise the verdict: case, spacing, underscores and synonyms."""
+    if not isinstance(value, str):
+        return None
+    key = ' '.join(value.replace('_', ' ').upper().split())
+    return _ACTION_ALIASES.get(key)
 
 
 def _strategy(value):
@@ -233,14 +295,19 @@ def _strategy(value):
 
 
 def _hold(value, bounds):
-    """Optional hold estimate: kept only if it is an in-window integer."""
+    """Optional hold estimate: accepts "12", 12 and 12.0 inside the window."""
     low, high = bounds
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+    try:
+        minutes = int(round(float(value)))
+    except (TypeError, ValueError):
+        _debug('dropped non-numeric hold_minutes')
+        return None
+    if not low <= minutes <= high:
         _debug(f'dropped hold_minutes outside {low}-{high}')
         return None
-    return value
+    return minutes
 
 
 def _num(value, digits: int = 2):
@@ -286,7 +353,7 @@ def build_snapshot(bars, a: dict, symbol: str, lower_tf=None) -> dict:
         'momentum': {
             'rsi7': _num(ind.get('rsi7'), 1), 'rsi14': _num(ind.get('rsi14'), 1),
             'macd': _num(ind.get('macd')), 'macd_signal': _num(ind.get('macd_signal')),
-            'macd_hist': _num(ind.get('macd')), 'macd_hist_prev_bars': [
+            'macd_hist': _num(ind.get('macd_hist')), 'macd_hist_prev_bars': [
                 _num(ind.get('macd_hist_1_ago')), _num(ind.get('macd_hist_2_ago'))],
             'stoch_k': _num(ind.get('stoch_k'), 1), 'stoch_d': _num(ind.get('stoch_d'), 1),
             'cci': _num(ind.get('cci'), 1), 'williams_r': _num(ind.get('williams_r'), 1),
